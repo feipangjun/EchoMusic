@@ -15,7 +15,9 @@ import { DEFAULT_PLAYER_VOLUME } from '../../shared/playback';
 import { CommandGate } from './commandGate';
 import { decideMediaDelivery, type RelaySource } from '../mediaTransport/delivery';
 import {
+  DLNA_POLL_INTERVAL_MS,
   DlnaBackend,
+  type DlnaPlaybackEnded,
   type UpnpDeviceSnapshot,
   type UpnpNativeLike,
 } from '../mediaTransport/dlnaAdapter';
@@ -418,6 +420,8 @@ export class OutputHost {
   private offlineStreak = 0;
   private diagnostics = '网络播放未开启';
   private pollTimer: { cancel(): void } | null = null;
+  private dlnaPollSeq = 0;
+  private completedDlnaPollSeq = 0;
   private renewTimer: { cancel(): void } | null = null;
   private readonly tapStatsTimers = new Set<{ cancel(): void }>();
   private subscription: { sid: string; url: string; host: string } | null = null;
@@ -1015,7 +1019,7 @@ export class OutputHost {
     this.offlineStreak = 0;
     this.mediaSessionId = `dlna:${this.routeEpoch}`;
     this.backendBus = new EventEmitter();
-    this.backend = new DlnaBackend({
+    const backend = new DlnaBackend({
       descriptionUrl: loaded.descriptionUrl,
       targetId: target.targetId,
       displayName: this.targetName,
@@ -1027,20 +1031,36 @@ export class OutputHost {
       avTransportServiceId: av.serviceId,
       renderingControlServiceId: rc?.serviceId,
     });
+    this.backend = backend;
     const token = this.sessionToken;
-    this.backendBus.on('playback-ended', (payload) => {
-      if (token !== this.sessionToken || this.link !== 'up') return;
+    this.backendBus.on('playback-ended', (payload: DlnaPlaybackEnded) => {
+      if (
+        this.shuttingDown ||
+        token !== this.sessionToken ||
+        backend !== this.backend ||
+        this.link !== 'up'
+      )
+        return;
+      this.position = payload.positionSec;
+      this.duration = payload.durationSec ?? this.duration;
+      this.trackSeq = payload.trackGeneration;
       this.playing = false;
+      this.log(
+        'info',
+        `DLNA 曲终: target=${this.targetName || this.targetId || '-'}, reason=${payload.reason}, position=${this.position}, duration=${this.duration}`,
+      );
       this.emitPlayer('state-change', this.statePayload());
       this.emitPlayer('playback-end', 'eof', {
-        trackSeq: this.playerEventTrackSeq(payload?.trackGeneration),
+        trackSeq: this.playerEventTrackSeq(),
         generation: this.routeEpoch,
       });
     });
     this.backendBus.on('taken-over', () => {
       if (token !== this.sessionToken) return;
       this.takenOver = true;
+      this.playing = false;
       this.diagnostics = '设备已被其他控制端接管，已停止自动推进';
+      this.emitPlayer('state-change', this.statePayload());
       this.publish();
     });
     this.dlnaTargets.set(target.targetId, {
@@ -1312,6 +1332,7 @@ export class OutputHost {
 
   beginSourceChange(): number {
     const id = this.commands.bump();
+    this.backend?.beginSourceChange();
     try {
       this.deps.local.beginSourceChange();
     } catch (error) {
@@ -1335,6 +1356,7 @@ export class OutputHost {
     return this.commands.run(async (generation) => {
       const position = this.position;
       const wasPlaying = this.playing;
+      this.backend?.beginSourceChange();
       const loaded = await this.loadBody(url, generation, generation, trackId);
       if (!loaded || generation !== this.commands.current) return null;
       if (position > 0) await this.seekBody(position, generation);
@@ -1460,17 +1482,17 @@ export class OutputHost {
 
   /** GENA 通知。旧会话的回调在替换 backend 后自然落到新门上会被拒绝。 */
   ingestLastChange(xml: string): void {
-    if (!this.backend || this.mode !== 'dlna' || this.link !== 'up' || !xml) return;
     const backend = this.backend;
+    if (!backend || !xml) return;
     const token = this.sessionToken;
+    const revision = backend.observationRevision;
+    const completedPoll = this.completedDlnaPollSeq;
+    if (!this.isCurrentDlnaObservation(backend, token, revision)) return;
     backend.handleLastChange(xml);
     void backend.getState().then((state) => {
       if (
-        this.shuttingDown ||
-        token !== this.sessionToken ||
-        backend !== this.backend ||
-        this.mode !== 'dlna' ||
-        this.link !== 'up'
+        !this.isCurrentDlnaObservation(backend, token, revision) ||
+        completedPoll !== this.completedDlnaPollSeq
       )
         return;
       this.position = state.positionSec;
@@ -1513,47 +1535,57 @@ export class OutputHost {
     this.publish();
   }
 
+  private isCurrentDlnaObservation(backend: DlnaBackend, token: number, revision: number): boolean {
+    return (
+      !this.shuttingDown &&
+      this.mode === 'dlna' &&
+      this.link === 'up' &&
+      token === this.sessionToken &&
+      backend === this.backend &&
+      revision === backend.observationRevision &&
+      !backend.transportCommandPending
+    );
+  }
+
   /** 测试和运行时共用的一次状态轮询。 */
   async pollOnce(): Promise<void> {
-    if (
-      this.shuttingDown ||
-      this.mode !== 'dlna' ||
-      this.link !== 'up' ||
-      !this.backend ||
-      !this.device ||
-      !this.deps.native
-    ) {
-      return;
-    }
-    const token = this.sessionToken;
     const backend = this.backend;
     const device = this.device;
+    const native = this.deps.native;
+    if (!backend || !device || !native) return;
+    const token = this.sessionToken;
+    const revision = backend.observationRevision;
+    if (!this.isCurrentDlnaObservation(backend, token, revision)) return;
     const av = findService(device.services, 'AVTransport');
     if (!av) return;
+    const pollSeq = ++this.dlnaPollSeq;
+    // 切歌（包括重播同一 URI）或手动操作期间，旧轮询可能晚于新轮询返回。
+    const isCurrent = () =>
+      this.isCurrentDlnaObservation(backend, token, revision) &&
+      pollSeq >= this.completedDlnaPollSeq;
     try {
-      const transport = await this.deps.native.action(
+      const transport = await native.action(
         device.descriptionUrl,
         av.serviceId,
         'GetTransportInfo',
         { InstanceID: '0' },
       );
-      if (this.shuttingDown || token !== this.sessionToken) return;
-      const position = await this.deps.native.action(
-        device.descriptionUrl,
-        av.serviceId,
-        'GetPositionInfo',
-        { InstanceID: '0' },
-      );
-      if (token !== this.sessionToken || this.link !== 'up') return;
+      if (!isCurrent()) return;
+      const position = await native.action(device.descriptionUrl, av.serviceId, 'GetPositionInfo', {
+        InstanceID: '0',
+      });
+      if (!isCurrent()) return;
+      this.completedDlnaPollSeq = pollSeq;
       this.offlineStreak = 0;
       backend.observeTransport({
         transportState: transport.CurrentTransportState,
+        transportStatus: transport.CurrentTransportStatus,
         positionSec: parseUpnpTime(position.RelTime),
         durationSec: parseUpnpTime(position.TrackDuration),
         trackUri: position.TrackURI ?? null,
       });
       const state = await backend.getState();
-      if (this.shuttingDown || token !== this.sessionToken || backend !== this.backend) return;
+      if (!isCurrent()) return;
       this.position = state.positionSec;
       this.duration = state.durationSec ?? this.duration;
       this.trackSeq = state.trackGeneration;
@@ -1572,7 +1604,8 @@ export class OutputHost {
         });
       }
     } catch (error) {
-      if (token !== this.sessionToken) return;
+      if (!isCurrent()) return;
+      this.completedDlnaPollSeq = pollSeq;
       if (!isTransportOffline(error)) return;
       this.offlineStreak += 1;
       if (this.offlineStreak >= OFFLINE_LIMIT) await this.loseLink('device-offline');
@@ -1801,10 +1834,28 @@ export class OutputHost {
         this.log('warn', `GENA 不可用，改为轮询: ${String(error)}`);
       }
     }
-    if (this.shuttingDown || token !== this.sessionToken) return;
-    this.pollTimer = this.schedule(() => {
-      void this.pollOnce();
-    }, 2000);
+    this.scheduleDlnaPoll(token);
+  }
+
+  private scheduleDlnaPoll(token: number): void {
+    if (
+      this.shuttingDown ||
+      token !== this.sessionToken ||
+      this.mode !== 'dlna' ||
+      this.link !== 'up'
+    )
+      return;
+    const interval = this.backend?.pollIntervalMs ?? DLNA_POLL_INTERVAL_MS;
+    const timer = this.schedule(() => {
+      if (this.pollTimer !== timer) return;
+      // The next probe may use a different cadence. Wait for this SOAP round trip
+      // to finish before scheduling another one, even if the device is slow.
+      timer.cancel();
+      void this.pollOnce().finally(() => {
+        if (this.pollTimer === timer) this.scheduleDlnaPoll(token);
+      });
+    }, interval);
+    this.pollTimer = timer;
   }
 
   private startAirplayWatch(token: number): void {
@@ -1999,8 +2050,8 @@ export class OutputHost {
     };
   }
 
-  private playerEventTrackSeq(fallback = this.trackSeq): number {
-    return this.playerTrackSeq > 0 ? this.playerTrackSeq : fallback;
+  private playerEventTrackSeq(): number {
+    return this.playerTrackSeq > 0 ? this.playerTrackSeq : this.trackSeq;
   }
 
   private emitPlayer(event: string, ...args: unknown[]): void {

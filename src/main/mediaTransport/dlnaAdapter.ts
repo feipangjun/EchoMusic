@@ -23,11 +23,9 @@ import {
   advanceGate,
   classifyRemoteStop,
   degradeCapability,
-  shouldEmitPlaybackEnded,
+  REMOTE_END_TOLERANCE_SEC,
   type CommandResult,
   type EpochGate,
-  type RemoteStopContext,
-  type StopClassification,
 } from '../outputs/sessionLogic';
 import { buildDidlLite, formatUpnpDuration } from './didlLite';
 import { parseLastChange } from './genaReceiver';
@@ -97,6 +95,34 @@ export const AV_TRANSPORT_SERVICE = 'urn:schemas-upnp-org:service:AVTransport:1'
 export const RENDERING_CONTROL_SERVICE = 'urn:schemas-upnp-org:service:RenderingControl:1';
 
 const STOPPED_STATES = new Set(['STOPPED', 'NO_MEDIA_PRESENT', 'IDLE']);
+export const DLNA_POLL_INTERVAL_MS = 2_000;
+const DLNA_TAIL_POLL_INTERVAL_MS = 300;
+const TAIL_POLL_WINDOW_SEC = 5;
+const TERMINAL_CONFIRM_MS = 3_000;
+const RECENT_SAMPLE_MS = 5_000;
+const RESTART_WINDOW_SEC = 5;
+const POSITION_JITTER_SEC = 0.25;
+
+type TransportObservation = {
+  transportState?: string;
+  transportStatus?: string;
+  positionSec?: number | null;
+  durationSec?: number | null;
+  trackUri?: string | null;
+};
+
+type PlaybackSample = {
+  positionSec: number;
+  durationSec: number;
+  observedAt: number;
+  ownUri: boolean;
+};
+
+export interface DlnaPlaybackEnded extends EpochGate {
+  positionSec: number;
+  durationSec: number | null;
+  reason: 'reported-stop' | 'position-stuck' | 'position-wrapped';
+}
 
 export { formatUpnpDuration } from './didlLite';
 
@@ -127,17 +153,30 @@ export class DlnaBackend implements OutputBackendLike {
     spectrum: false,
   };
   private currentUri = '';
+  private previousUri: { value: string; expiresAt: number } | null = null;
   private durationSec: number | null = null;
   private volume: number | null = null;
   private trackMeta: OutputTrackMeta = {};
-  private pendingCommand: RemoteStopContext['pendingCommand'] = 'none';
   private lastKnownState = 'STOPPED';
   private lastKnownPositionSec = 0;
   private positionUpdatedAt = 0;
-  private lastClassification: StopClassification = {
-    kind: 'user-stop',
-    proceed: false,
-  };
+  private transportRevision = 0;
+  private activeTransportCommand: number | null = null;
+  private endDetectionEnabled = false;
+  private seekTarget: {
+    positionSec: number;
+    previousPositionSec: number;
+    observedAt: number;
+  } | null = null;
+  private lastPlayingSample: PlaybackSample | null = null;
+  private lastAdvancingSample: PlaybackSample | null = null;
+  private terminalSample: PlaybackSample | null = null;
+  private wrapCandidate: Omit<PlaybackSample, 'ownUri'> | null = null;
+  private progressObserved = false;
+  private endEmitted = false;
+  private awaitingReplayProgress = false;
+  private takenOver = false;
+  private endStopFlight: Promise<unknown> | null = null;
   private readonly avTransportId: string;
   private readonly renderingId: string;
   private sourceMime = 'audio/*';
@@ -171,33 +210,66 @@ export class DlnaBackend implements OutputBackendLike {
   }
 
   beginSourceChange(): number {
+    this.transportRevision++;
+    this.endDetectionEnabled = false;
+    this.seekTarget = null;
+    this.clearEndEvidence();
     return this.gate.routeEpoch;
   }
 
+  get observationRevision(): number {
+    return this.transportRevision;
+  }
+
+  get transportCommandPending(): boolean {
+    return this.activeTransportCommand !== null;
+  }
+
+  get pollIntervalMs(): number {
+    if (
+      !this.endDetectionEnabled ||
+      this.transportCommandPending ||
+      this.lastKnownState !== 'PLAYING'
+    ) {
+      return DLNA_POLL_INTERVAL_MS;
+    }
+    const now = this.now();
+    const candidate = this.wrapCandidate;
+    const advancing = this.lastAdvancingSample;
+    if (
+      (candidate && now - candidate.observedAt <= RECENT_SAMPLE_MS) ||
+      (advancing &&
+        advancing.durationSec - advancing.positionSec <= TAIL_POLL_WINDOW_SEC &&
+        now - advancing.observedAt <= RECENT_SAMPLE_MS)
+    ) {
+      return DLNA_TAIL_POLL_INTERVAL_MS;
+    }
+    return DLNA_POLL_INTERVAL_MS;
+  }
+
   async load(url: string): Promise<{ seq: number; duration: number } | null> {
-    const meta = this.didlFor(url);
-    await this.soap(this.avTransportId, 'SetAVTransportURI', {
-      InstanceID: '0',
-      CurrentURI: url,
-      CurrentURIMetaData: meta,
-    });
-    await this.setNormalPlayMode();
-    this.gate = advanceGate(this.gate, true);
-    this.recordLoadedSource(url);
-    return { seq: this.gate.trackGeneration, duration: this.durationSec ?? 0 };
+    return this.loadUri(url);
   }
 
   async loadMkv(url: string, trackId: number): Promise<{ seq: number; duration: number } | null> {
-    const meta = this.didlFor(url, `track-${trackId}`);
-    await this.soap(this.avTransportId, 'SetAVTransportURI', {
-      InstanceID: '0',
-      CurrentURI: url,
-      CurrentURIMetaData: meta,
+    return this.loadUri(url, `track-${trackId}`);
+  }
+
+  private loadUri(url: string, title?: string) {
+    return this.runTransportCommand(async (isCurrent) => {
+      if (!isCurrent()) return null;
+      await this.soap(this.avTransportId, 'SetAVTransportURI', {
+        InstanceID: '0',
+        CurrentURI: url,
+        CurrentURIMetaData: this.didlFor(url, title),
+      });
+      if (!isCurrent()) return null;
+      await this.setNormalPlayMode();
+      if (!isCurrent()) return null;
+      this.gate = advanceGate(this.gate, true);
+      this.recordLoadedSource(url);
+      return { seq: this.gate.trackGeneration, duration: this.durationSec ?? 0 };
     });
-    await this.setNormalPlayMode();
-    this.gate = advanceGate(this.gate, true);
-    this.recordLoadedSource(url);
-    return { seq: this.gate.trackGeneration, duration: this.durationSec ?? 0 };
   }
 
   private async setNormalPlayMode(): Promise<void> {
@@ -212,13 +284,45 @@ export class DlnaBackend implements OutputBackendLike {
   }
 
   private recordLoadedSource(url: string): void {
+    const now = this.now();
+    if (this.currentUri && url !== this.currentUri) {
+      this.previousUri = { value: this.currentUri, expiresAt: now + RECENT_SAMPLE_MS };
+    }
+    this.awaitingReplayProgress = url === this.currentUri;
     this.currentUri = url;
     this.durationSec = this.trackMeta.durationMs != null ? this.trackMeta.durationMs / 1000 : null;
     this.lastKnownPositionSec = 0;
-    this.positionUpdatedAt = this.now();
+    this.positionUpdatedAt = now;
     this.lastKnownState = 'STOPPED';
-    this.pendingCommand = 'none';
-    this.lastClassification = { kind: 'user-stop', proceed: false };
+    this.endDetectionEnabled = false;
+    this.seekTarget = null;
+    this.endEmitted = false;
+    this.takenOver = false;
+    this.clearEndEvidence();
+  }
+
+  private clearEndEvidence(): void {
+    this.lastPlayingSample = null;
+    this.lastAdvancingSample = null;
+    this.terminalSample = null;
+    this.wrapCandidate = null;
+    this.progressObserved = false;
+  }
+
+  private async runTransportCommand<T>(run: (isCurrent: () => boolean) => Promise<T>): Promise<T> {
+    const command = ++this.transportRevision;
+    this.activeTransportCommand = command;
+    const isCurrent = () => this.transportRevision === command;
+    try {
+      // A Stop sent at an inferred EOF must finish before setting the next URI.
+      if (this.endStopFlight) await this.endStopFlight;
+      return await run(isCurrent);
+    } finally {
+      if (this.activeTransportCommand === command) {
+        this.activeTransportCommand = null;
+        this.transportRevision++;
+      }
+    }
   }
 
   async setTrackMeta(meta: OutputTrackMeta): Promise<void> {
@@ -239,35 +343,61 @@ export class DlnaBackend implements OutputBackendLike {
   }
 
   async play(): Promise<void> {
-    await this.soap(this.avTransportId, 'Play', { InstanceID: '0', Speed: '1' });
-    this.pendingCommand = 'none';
-    this.lastKnownState = 'PLAYING';
+    await this.runTransportCommand(async (isCurrent) => {
+      if (!isCurrent()) return;
+      await this.soap(this.avTransportId, 'Play', { InstanceID: '0', Speed: '1' });
+      if (!isCurrent()) return;
+      this.lastKnownState = 'PLAYING';
+      this.awaitingReplayProgress ||= this.endEmitted;
+      this.endEmitted = false;
+      this.clearEndEvidence();
+      this.endDetectionEnabled = Boolean(this.currentUri);
+    });
   }
 
   async pause(): Promise<void> {
-    await this.soap(this.avTransportId, 'Pause', { InstanceID: '0' });
-    this.lastKnownState = 'PAUSED_PLAYBACK';
+    await this.runTransportCommand(async (isCurrent) => {
+      if (!isCurrent()) return;
+      await this.soap(this.avTransportId, 'Pause', { InstanceID: '0' });
+      if (!isCurrent()) return;
+      this.endDetectionEnabled = false;
+      this.clearEndEvidence();
+      if (!this.endEmitted) this.lastKnownState = 'PAUSED_PLAYBACK';
+    });
   }
 
   async stop(): Promise<void> {
-    this.pendingCommand = 'stop';
-    try {
+    await this.runTransportCommand(async (isCurrent) => {
+      if (!isCurrent()) return;
       await this.soap(this.avTransportId, 'Stop', { InstanceID: '0' });
-    } catch (error) {
-      this.pendingCommand = 'none';
-      throw error;
-    }
-    this.lastKnownState = 'STOPPED';
-    this.lastKnownPositionSec = 0;
+      if (!isCurrent()) return;
+      this.endDetectionEnabled = false;
+      this.seekTarget = null;
+      this.endEmitted = false;
+      this.clearEndEvidence();
+      this.lastKnownState = 'STOPPED';
+      this.lastKnownPositionSec = 0;
+    });
   }
 
   async seek(timeSec: number): Promise<void> {
-    await this.soap(this.avTransportId, 'Seek', {
-      InstanceID: '0',
-      Unit: 'REL_TIME',
-      Target: formatUpnpDuration(timeSec) ?? '00:00:00',
+    await this.runTransportCommand(async (isCurrent) => {
+      if (!isCurrent()) return;
+      await this.soap(this.avTransportId, 'Seek', {
+        InstanceID: '0',
+        Unit: 'REL_TIME',
+        Target: formatUpnpDuration(timeSec) ?? '00:00:00',
+      });
+      if (!isCurrent()) return;
+      const observedAt = this.now();
+      this.seekTarget = {
+        positionSec: timeSec,
+        previousPositionSec: this.lastKnownPositionSec,
+        observedAt,
+      };
+      this.recordPosition(timeSec, observedAt);
+      this.clearEndEvidence();
     });
-    this.lastKnownPositionSec = timeSec;
   }
 
   async setVolume(volume: number): Promise<void> {
@@ -311,7 +441,6 @@ export class DlnaBackend implements OutputBackendLike {
     return this.lastKnownState !== 'STOPPED';
   }
 
-  /** LastChange 上报：只做事件分类与纪元过滤，不在此重放命令。 */
   private async soap(
     serviceId: string,
     actionName: string,
@@ -336,61 +465,258 @@ export class DlnaBackend implements OutputBackendLike {
     }
   }
 
-  /**
-   * 轮询或 GENA 共用的观测入口。pending 命令只抑制这一次判定，
-   * 避免用户 Stop 之后把曲尾的下一次 STOPPED 永久当成非 EOF。
-   */
-  observeTransport(
-    update: {
-      transportState?: string;
-      positionSec?: number | null;
-      durationSec?: number | null;
-      trackUri?: string | null;
-    },
-    eventGate: EpochGate = this.gate,
-  ): void {
-    if (!acceptsEvent(this.gate, eventGate)) return;
-    if (update.durationSec != null && Number.isFinite(update.durationSec)) {
-      this.durationSec = update.durationSec;
-    }
-    if (update.positionSec != null && Number.isFinite(update.positionSec)) {
-      this.lastKnownPositionSec = update.positionSec;
-      this.positionUpdatedAt = this.now();
-    }
-    const state = update.transportState;
-    if (!state) return;
-    const prev = this.lastClassification;
-    if (!STOPPED_STATES.has(state)) {
-      this.lastKnownState = state;
+  /** 轮询和 GENA 共用观测入口。 */
+  observeTransport(update: TransportObservation, eventGate: EpochGate = this.gate): void {
+    if (this.transportCommandPending || !acceptsEvent(this.gate, eventGate)) return;
+    const state = update.transportState?.trim().toUpperCase();
+    const uri = update.trackUri?.trim() || null;
+    const now = this.now();
+    const { durationSec, positionSec } = update;
+    const duration =
+      durationSec != null && Number.isFinite(durationSec) && durationSec > 0 ? durationSec : null;
+    const position =
+      positionSec != null && Number.isFinite(positionSec) && positionSec >= 0 ? positionSec : null;
+
+    if (update.transportStatus?.toUpperCase().includes('ERROR')) {
+      this.clearEndEvidence();
+      if (!this.endEmitted) this.lastKnownState = 'UNKNOWN';
       return;
     }
-    this.lastKnownState = state;
-    const next = classifyRemoteStop({
-      currentUri: this.currentUri,
-      eventUri: update.trackUri ?? null,
-      durationSec: this.durationSec,
-      positionSec: this.lastKnownPositionSec,
-      reportedState: state,
-      pendingCommand: this.pendingCommand,
-      sessionEpoch: eventGate.routeEpoch,
-      activeEpoch: this.gate.routeEpoch,
-      trackGeneration: eventGate.trackGeneration,
-      activeGeneration: this.gate.trackGeneration,
-      ceassedLastPoll: true,
-      nearEnd: false,
-    });
-    if (this.pendingCommand !== 'none') this.pendingCommand = 'none';
-    if (next.kind === 'other-controller' && prev.kind !== 'other-controller') {
-      this.bus.emit('taken-over', { targetId: this.deps.targetId });
+
+    if (this.currentUri && uri && uri !== this.currentUri) {
+      // After SetAVTransportURI, notifications and position replies for the old
+      // track can still arrive. Give only that URI a short transition window.
+      if (uri === this.previousUri?.value && now <= this.previousUri.expiresAt) return;
+      this.endDetectionEnabled = false;
+      this.clearEndEvidence();
+      this.lastKnownState = 'STOPPED';
+      if (!this.takenOver) {
+        this.takenOver = true;
+        this.bus.emit('taken-over', { targetId: this.deps.targetId });
+      }
+      return;
     }
-    if (shouldEmitPlaybackEnded(prev, next)) {
-      this.bus.emit('playback-ended', {
-        targetId: this.deps.targetId,
-        trackGeneration: this.gate.trackGeneration,
-        routeEpoch: this.gate.routeEpoch,
+
+    if (this.endEmitted || this.takenOver) return;
+    if (duration != null) this.durationSec = duration;
+    const sample =
+      position != null && duration != null
+        ? {
+            positionSec: position,
+            durationSec: duration,
+            observedAt: now,
+            ownUri: uri === this.currentUri,
+          }
+        : null;
+
+    if (this.seekTarget) {
+      const elapsed = Math.max(0, now - this.seekTarget.observedAt);
+      const reachedSeekTarget =
+        state === 'PLAYING' &&
+        position != null &&
+        position >= this.seekTarget.positionSec - REMOTE_END_TOLERANCE_SEC &&
+        (this.seekTarget.previousPositionSec < this.seekTarget.positionSec ||
+          position <= this.seekTarget.positionSec + elapsed / 1_000 + REMOTE_END_TOLERANCE_SEC);
+      if (!reachedSeekTarget && elapsed <= RECENT_SAMPLE_MS) return;
+      this.seekTarget = null;
+      if (state) this.lastKnownState = state;
+      if (position != null) this.recordPosition(position, now);
+      if (reachedSeekTarget) {
+        this.awaitingReplayProgress = false;
+        this.lastPlayingSample = sample;
+      }
+      return;
+    }
+
+    if (this.endDetectionEnabled && this.awaitingReplayProgress) {
+      // A repeated URI may still report the previous play's final STOPPED or position.
+      if (state !== 'PLAYING' || position == null) return;
+      const knownDuration = this.durationSec;
+      if (
+        position !== 0 &&
+        (knownDuration == null
+          ? position > RESTART_WINDOW_SEC
+          : position >= knownDuration - REMOTE_END_TOLERANCE_SEC)
+      )
+        return;
+      this.awaitingReplayProgress = false;
+    }
+
+    if (state && STOPPED_STATES.has(state)) {
+      const tail = this.lastPlayingSample;
+      const recentTail = this.isNearEnd(tail) && now - tail.observedAt <= RECENT_SAMPLE_MS;
+      const stopped = classifyRemoteStop({
+        currentUri: this.currentUri,
+        eventUri: uri,
+        durationSec: duration ?? tail?.durationSec ?? null,
+        positionSec: position,
+        reportedState: state,
+        pendingCommand: 'none',
+        sessionEpoch: eventGate.routeEpoch,
+        activeEpoch: this.gate.routeEpoch,
+        trackGeneration: eventGate.trackGeneration,
+        activeGeneration: this.gate.trackGeneration,
+        nearEnd: (position == null || position === 0) && recentTail,
       });
+      if (this.endDetectionEnabled && stopped.proceed) {
+        this.finishPlayback('reported-stop', duration ?? tail?.durationSec ?? this.durationSec);
+        return;
+      }
+      this.endDetectionEnabled = false;
+      this.clearEndEvidence();
     }
-    this.lastClassification = next;
+
+    if (state) this.lastKnownState = state;
+    if (state === 'PAUSED_PLAYBACK') this.clearEndEvidence();
+    if (state === 'PLAYING' && this.endDetectionEnabled && position != null) {
+      const sameUri = uri === this.currentUri;
+      if (this.observePlaying(position, sample, sameUri, durationSec === 0, now)) return;
+    }
+    if (position != null) this.recordPosition(position, now);
+  }
+
+  /** 返回 true 表示保留曲尾时间，不把设备试图回卷的进度显示给用户。 */
+  private observePlaying(
+    position: number,
+    sample: PlaybackSample | null,
+    sameUri: boolean,
+    zeroDuration: boolean,
+    now: number,
+  ): boolean {
+    const previous = this.lastPlayingSample;
+    this.lastPlayingSample = sample;
+
+    const candidate = this.wrapCandidate;
+    if (candidate) {
+      const stillAtStart =
+        position <= RESTART_WINDOW_SEC &&
+        now - candidate.observedAt <= RECENT_SAMPLE_MS &&
+        (sample == null ||
+          Math.abs(sample.durationSec - candidate.durationSec) <= REMOTE_END_TOLERANCE_SEC);
+      if (stillAtStart) {
+        if (sameUri && sample && position > candidate.positionSec + POSITION_JITTER_SEC) {
+          this.finishPlayback('position-wrapped', sample.durationSec);
+        }
+        return true;
+      }
+      this.wrapCandidate = null;
+    }
+
+    if (
+      this.isNearEnd(previous) &&
+      now - previous.observedAt <= RECENT_SAMPLE_MS &&
+      position <= RESTART_WINDOW_SEC &&
+      previous.positionSec - position > REMOTE_END_TOLERANCE_SEC
+    ) {
+      const advancing = this.lastAdvancingSample;
+      // Repeated integer-second samples are common. Anchor the deadline to the last
+      // real advance, and only use it to confirm a reset reported by the renderer.
+      const expectedEndReached =
+        previous.ownUri &&
+        advancing &&
+        previous.positionSec === advancing.positionSec &&
+        previous.durationSec === advancing.durationSec &&
+        now - advancing.observedAt >= (previous.durationSec - previous.positionSec) * 1_000 &&
+        now - advancing.observedAt <= RECENT_SAMPLE_MS;
+      if (sameUri && position === 0 && zeroDuration && expectedEndReached) {
+        this.finishPlayback('position-wrapped', previous.durationSec);
+        return true;
+      }
+      this.wrapCandidate = {
+        positionSec: position,
+        durationSec: previous.durationSec,
+        observedAt: now,
+      };
+      this.lastAdvancingSample = null;
+      this.terminalSample = null;
+      return true;
+    }
+
+    this.recordPlaybackAdvance(previous, sample);
+    if (previous && sample && position > previous.positionSec + POSITION_JITTER_SEC) {
+      this.progressObserved = true;
+    }
+    if (
+      sample == null ||
+      Math.abs(sample.positionSec - sample.durationSec) > POSITION_JITTER_SEC ||
+      !this.progressObserved
+    ) {
+      this.terminalSample = null;
+      return false;
+    }
+
+    const terminal = this.terminalSample;
+    if (
+      terminal == null ||
+      previous == null ||
+      now - previous.observedAt > RECENT_SAMPLE_MS ||
+      Math.abs(position - terminal.positionSec) > POSITION_JITTER_SEC ||
+      Math.abs(sample.durationSec - terminal.durationSec) > POSITION_JITTER_SEC
+    ) {
+      this.terminalSample = sample;
+    } else if (now - terminal.observedAt >= TERMINAL_CONFIRM_MS) {
+      this.finishPlayback('position-stuck', sample.durationSec);
+      return true;
+    }
+    return false;
+  }
+
+  private recordPlaybackAdvance(
+    previous: PlaybackSample | null,
+    sample: PlaybackSample | null,
+  ): void {
+    if (!previous?.ownUri || !sample?.ownUri) {
+      this.lastAdvancingSample = null;
+      return;
+    }
+    const elapsedMs = sample.observedAt - previous.observedAt;
+    const advance = sample.positionSec - previous.positionSec;
+    if (
+      elapsedMs < 0 ||
+      elapsedMs > RECENT_SAMPLE_MS ||
+      Math.abs(sample.durationSec - previous.durationSec) > POSITION_JITTER_SEC ||
+      advance < -POSITION_JITTER_SEC ||
+      advance > elapsedMs / 1_000 + 1
+    ) {
+      this.lastAdvancingSample = null;
+    } else if (advance > POSITION_JITTER_SEC) {
+      this.lastAdvancingSample = sample;
+    }
+  }
+
+  private isNearEnd(sample: PlaybackSample | null): sample is PlaybackSample {
+    return (
+      sample != null &&
+      sample.positionSec > 0 &&
+      sample.positionSec >= sample.durationSec - REMOTE_END_TOLERANCE_SEC
+    );
+  }
+
+  private recordPosition(position: number, observedAt: number): void {
+    this.lastKnownPositionSec = position;
+    this.positionUpdatedAt = observedAt;
+  }
+
+  private finishPlayback(reason: DlnaPlaybackEnded['reason'], duration: number | null): void {
+    this.endEmitted = true;
+    this.endDetectionEnabled = false;
+    this.lastKnownState = 'STOPPED';
+    this.clearEndEvidence();
+    this.durationSec = duration;
+    if (duration != null) this.recordPosition(duration, this.now());
+    if (reason !== 'reported-stop') {
+      this.endStopFlight = this.soap(this.avTransportId, 'Stop', { InstanceID: '0' })
+        .catch(() => undefined)
+        .finally(() => {
+          this.endStopFlight = null;
+        });
+    }
+    this.bus.emit('playback-ended', {
+      ...this.gate,
+      positionSec: this.lastKnownPositionSec,
+      durationSec: this.durationSec,
+      reason,
+    } satisfies DlnaPlaybackEnded);
   }
 
   /** LastChange 上报：只做事件分类与纪元过滤，不在此重放命令。 */
@@ -400,6 +726,7 @@ export class DlnaBackend implements OutputBackendLike {
     this.observeTransport(
       {
         transportState: parsed.values.TransportState,
+        transportStatus: parsed.values.TransportStatus,
         positionSec: parseUpnpDuration(parsed.values.RelativeTimePosition),
         durationSec: parseUpnpDuration(parsed.values.CurrentTrackDuration),
         trackUri: parsed.values.CurrentTrackURI ?? parsed.values.AVTransportURI ?? null,

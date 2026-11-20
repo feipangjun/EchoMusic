@@ -17,7 +17,7 @@ export interface RemoteStopContext {
   currentUri: string;
   eventUri: string | null;
   durationSec: number | null;
-  positionSec: number;
+  positionSec: number | null;
   /** 设备报告的 TransportState = STOPPED / NO_MEDIA_PRESENT 等 */
   reportedState: string;
   pendingCommand: 'play' | 'pause' | 'seek' | 'next' | 'stop' | 'none';
@@ -25,7 +25,6 @@ export interface RemoteStopContext {
   activeEpoch: number;
   trackGeneration: number;
   activeGeneration: number;
-  ceassedLastPoll: boolean;
   /** 贴近曲尾（位置 + 缓冲余量 >= duration） */
   nearEnd: boolean;
 }
@@ -39,6 +38,7 @@ export type StopClassification =
   | { kind: 'pending-command'; proceed: false };
 
 const STOPPED_STATES = ['STOPPED', 'NO_MEDIA_PRESENT', 'IDLE'];
+export const REMOTE_END_TOLERANCE_SEC = 2.5;
 
 /**
  * EOF 判定：远端 STOPPED 不能直接当作 EOF。
@@ -51,38 +51,26 @@ export function classifyRemoteStop(ctx: RemoteStopContext): StopClassification {
   if (ctx.sessionEpoch !== ctx.activeEpoch || ctx.trackGeneration !== ctx.activeGeneration) {
     return { kind: 'stale', proceed: false };
   }
-  if (ctx.currentUri && ctx.eventUri && ctx.eventUri !== ctx.currentUri) {
+  if (ctx.eventUri && ctx.eventUri !== ctx.currentUri) {
     return { kind: 'other-controller', proceed: false };
   }
   if (ctx.pendingCommand !== 'none') {
     // 我们自己的命令可能刚把设备带到 STOPPED（如 stop/seek 边界）。
     return { kind: 'pending-command', proceed: false };
   }
-  if (ctx.eventUri !== null && ctx.eventUri !== ctx.currentUri)
-    return { kind: 'other-controller', proceed: false };
-
-  const stopped = STOPPED_STATES.some((s) => ctx.reportedState.toUpperCase().includes(s));
+  const stopped = STOPPED_STATES.includes(ctx.reportedState.toUpperCase());
   if (!stopped) return { kind: 'user-stop', proceed: false };
 
   const atEnd =
     ctx.durationSec != null &&
     Number.isFinite(ctx.durationSec) &&
     ctx.durationSec > 0 &&
-    ctx.positionSec >= ctx.durationSec - 2.5;
+    ctx.positionSec != null &&
+    ctx.positionSec > 0 &&
+    ctx.positionSec >= ctx.durationSec - REMOTE_END_TOLERANCE_SEC;
 
   if (ctx.nearEnd || atEnd) return { kind: 'eof', proceed: true };
-  // 已知时长但停在中间：用户停止或外部控制。
-  if (ctx.durationSec != null && ctx.durationSec > 0) return { kind: 'user-stop', proceed: false };
-  // 时长未知：无法证明自然结束。
   return { kind: 'user-stop', proceed: false };
-}
-
-/** EOF 校验：自然结束只推进一次（配合宿主侧 generation 递增）。 */
-export function shouldEmitPlaybackEnded(
-  prev: StopClassification,
-  next: StopClassification,
-): boolean {
-  return prev.kind !== 'eof' && next.kind === 'eof';
 }
 
 export interface EpochGate {

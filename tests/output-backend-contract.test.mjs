@@ -70,11 +70,14 @@ test('DLNA volume keeps device percentages in SOAP commands and snapshots', asyn
     await backend.setVolume(volume);
     assert.equal((await backend.getState()).volume, volume);
   }
-  assert.deepEqual(commands, [0, 50, 80, 100].map((volume) => ({
-    InstanceID: '0',
-    Channel: 'Master',
-    DesiredVolume: String(volume),
-  })));
+  assert.deepEqual(
+    commands,
+    [0, 50, 80, 100].map((volume) => ({
+      InstanceID: '0',
+      Channel: 'Master',
+      DesiredVolume: String(volume),
+    })),
+  );
 });
 
 test('DLNA snapshots use shared state values and source switching returns position, duration, sequence', async () => {
@@ -116,10 +119,54 @@ test('DLNA EOF classification keeps the observed position and rejects duplicate/
   });
   backend.handleLastChange(stopped, { routeEpoch: -1, trackGeneration: -1 });
   assert.equal(ended, 0);
+  await backend.play();
   backend.handleLastChange(stopped);
   backend.handleLastChange(stopped);
   assert.equal(ended, 1);
   assert.equal((await backend.getState()).positionSec, 120);
+});
+
+test('DLNA recognizes EOF when the renderer resets its position at STOPPED', async () => {
+  const { backend, bus } = setup();
+  let ended = 0;
+  bus.on('playback-ended', () => ended++);
+  await backend.load('http://example.test/song');
+  await backend.play();
+
+  backend.observeTransport({
+    transportState: 'PLAYING',
+    positionSec: 118,
+    durationSec: 120,
+    trackUri: 'http://example.test/song',
+  });
+  backend.observeTransport({
+    transportState: 'STOPPED',
+    positionSec: 0,
+    durationSec: 120,
+    trackUri: 'http://example.test/song',
+  });
+  backend.observeTransport({
+    transportState: 'STOPPED',
+    positionSec: 0,
+    durationSec: 120,
+    trackUri: 'http://example.test/song',
+  });
+
+  assert.equal(ended, 1);
+});
+
+test('DLNA ignores stale STOPPED reports before playback starts', async () => {
+  const { backend, bus } = setup();
+  let ended = 0;
+  bus.on('playback-ended', () => ended++);
+  await backend.load('http://example.test/song');
+  backend.observeTransport({
+    transportState: 'STOPPED',
+    positionSec: 120,
+    durationSec: 120,
+    trackUri: 'http://example.test/song',
+  });
+  assert.equal(ended, 0);
 });
 
 test('user stop and an external URI near the end are not EOF', async () => {
@@ -145,6 +192,26 @@ test('user stop and an external URI near the end are not EOF', async () => {
     }),
   );
   assert.equal(ended, 0);
+
+  const userStoppedNearEnd = setup();
+  let userStopEnded = 0;
+  userStoppedNearEnd.bus.on('playback-ended', () => userStopEnded++);
+  await userStoppedNearEnd.backend.load('http://example.test/song');
+  await userStoppedNearEnd.backend.play();
+  userStoppedNearEnd.backend.observeTransport({
+    transportState: 'PLAYING',
+    positionSec: 118,
+    durationSec: 120,
+    trackUri: 'http://example.test/song',
+  });
+  await userStoppedNearEnd.backend.stop();
+  userStoppedNearEnd.backend.observeTransport({
+    transportState: 'STOPPED',
+    positionSec: 0,
+    durationSec: 120,
+    trackUri: 'http://example.test/song',
+  });
+  assert.equal(userStopEnded, 0);
 });
 
 test('failed SOAP commands reject without changing the session gate', async () => {

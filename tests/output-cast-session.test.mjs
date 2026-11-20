@@ -104,6 +104,7 @@ function harness(options = {}) {
   };
   const transport = {
     state: 'PLAYING',
+    status: 'OK',
     rel: '00:00:01',
     dur: '00:02:00',
     uri: 'https://cdn.example/song.mp3',
@@ -121,11 +122,26 @@ function harness(options = {}) {
     async action(_url, serviceId, name, args) {
       calls.push({ serviceId, name, args });
       if (gate && name === 'SetAVTransportURI') return gate;
+      if (name === 'SetPlayMode' && options.beforeSetPlayModeReply) {
+        await options.beforeSetPlayModeReply();
+      }
+      if (name === 'Stop' && options.beforeStopReply) await options.beforeStopReply();
       if (name === 'GetProtocolInfo') return { Sink: 'http-get:*:audio/mpeg:*' };
       if (name === 'GetVolume') return { CurrentVolume: '20' };
-      if (name === 'GetTransportInfo') return { CurrentTransportState: transport.state };
+      if (name === 'GetTransportInfo') {
+        return {
+          CurrentTransportState: transport.state,
+          CurrentTransportStatus: transport.status,
+        };
+      }
       if (name === 'GetPositionInfo') {
-        return { RelTime: transport.rel, TrackDuration: transport.dur, TrackURI: transport.uri };
+        const snapshot = {
+          RelTime: transport.rel,
+          TrackDuration: transport.dur,
+          TrackURI: transport.uri,
+        };
+        if (options.beforePositionReply) await options.beforePositionReply();
+        return snapshot;
       }
       return {};
     },
@@ -133,14 +149,14 @@ function harness(options = {}) {
   };
   const media = new MediaServer({ bindHost: '127.0.0.1', log: () => {} });
   const host = new OutputHost({
-    now: () => 1_000,
+    now: options.now ?? (() => 1_000),
     local,
     native: options.native ?? native,
     airplay: options.airplay,
     media,
     allowLoopbackRelay: true,
     localNetworkIdentity: options.localNetworkIdentity,
-    schedule: () => ({ cancel() {} }),
+    schedule: options.schedule ?? (() => ({ cancel() {} })),
     emitPlayer: (event, ...args) => player.push([event, ...args]),
     emitOutput: (event) => output.push(event),
     log: (level, message) => logs.push([level, message]),
@@ -164,6 +180,20 @@ function harness(options = {}) {
       gate = pending.then(() => ({}));
       return () => release({});
     },
+  };
+}
+
+function timedDlnaHarness(options = {}) {
+  let now = 1_000;
+  const box = harness({ ...options, now: () => now });
+  return {
+    ...box,
+    async poll(update = {}, delayMs = 2_000) {
+      Object.assign(box.transport, update);
+      now += delayMs;
+      await box.host.pollOnce();
+    },
+    ended: () => box.player.filter(([event]) => event === 'playback-end'),
   };
 }
 
@@ -415,6 +445,7 @@ test('natural STOPPED emits one EOF and a user stop or external URI does not', a
     await host.connect('uuid:renderer-1');
     const requestId = host.beginSourceChange();
     await host.load('https://cdn.example/song.mp3', requestId);
+    await host.play();
     transport.state = 'STOPPED';
     transport.rel = '00:02:00';
     transport.uri = 'https://cdn.example/song.mp3';
@@ -439,14 +470,462 @@ test('natural STOPPED emits one EOF and a user stop or external URI does not', a
     await taken.host.connect('uuid:renderer-1');
     const takenRequest = taken.host.beginSourceChange();
     await taken.host.load('https://cdn.example/song.mp3', takenRequest);
+    await taken.host.play();
     taken.transport.state = 'STOPPED';
     taken.transport.rel = '00:02:00';
     taken.transport.uri = 'http://other.example/song.mp3';
     await taken.host.pollOnce();
     assert.equal(taken.player.filter((event) => event[0] === 'playback-end').length, 0);
     assert.match(taken.host.diagnosticMessage, /接管/);
+    assert.equal((await taken.host.getState()).playing, false);
     await taken.media.stop();
   } finally {
+    await media.stop();
+  }
+});
+
+test('DLNA still emits EOF when STOPPED resets the renderer position to zero', async () => {
+  const box = harness();
+  try {
+    await box.host.connect('uuid:renderer-1');
+    const requestId = box.host.beginSourceChange();
+    await box.host.load('https://cdn.example/song.mp3', requestId);
+    await box.host.play();
+
+    box.transport.state = 'PLAYING';
+    box.transport.rel = '00:01:58';
+    await box.host.pollOnce();
+    box.transport.state = 'STOPPED';
+    box.transport.rel = '00:00:00';
+    await box.host.pollOnce();
+    await box.host.pollOnce();
+
+    assert.equal(box.player.filter((event) => event[0] === 'playback-end').length, 1);
+    assert.equal(box.player.find((event) => event[0] === 'playback-end')[1], 'eof');
+  } finally {
+    await box.media.stop();
+  }
+});
+
+test('DLNA keeps the completed timeline when a TV clears track details at STOPPED', async () => {
+  const { host, transport, media, poll, ended } = timedDlnaHarness();
+  try {
+    await host.connect('uuid:renderer-1');
+    const loaded = await host.load(transport.uri, host.beginSourceChange());
+    await host.play();
+    await poll({ dur: '00:03:30', rel: '00:03:28' });
+    await poll({ state: 'STOPPED', uri: '', rel: '00:00:00', dur: '00:00:00' });
+    await poll();
+
+    assert.deepEqual(
+      ended().map(([, reason, context]) => [reason, context.trackSeq]),
+      [['eof', loaded.seq]],
+    );
+    const state = await host.getState();
+    assert.equal(state.playing, false);
+    assert.equal(state.timePos, 210);
+    assert.equal(state.duration, 210);
+  } finally {
+    await media.stop();
+  }
+});
+
+test('DLNA stops the 0998 same-track wrap as soon as position and duration reset at the end', async () => {
+  const { host, transport, media, poll, ended, calls } = timedDlnaHarness();
+  try {
+    await host.connect('uuid:renderer-1');
+    const loaded = await host.load(transport.uri, host.beginSourceChange());
+    await host.play();
+    await poll({ dur: '00:03:30', rel: '00:03:26' });
+    await poll({ rel: '00:03:28' });
+    assert.deepEqual(ended(), []);
+
+    await poll({ rel: '00:00:00', dur: '00:00:00' });
+    assert.equal(ended().length, 1);
+    assert.equal(calls.filter(({ name }) => name === 'Stop').length, 1);
+
+    await poll();
+    await poll({ rel: '00:00:01', dur: '00:03:30' });
+    assert.deepEqual(
+      ended().map(([, reason, context]) => [reason, context.trackSeq]),
+      [['eof', loaded.seq]],
+    );
+    assert.equal(calls.filter(({ name }) => name === 'Stop').length, 1);
+    const state = await host.getState();
+    assert.equal(state.playing, false);
+    assert.equal(state.timePos, 210);
+    assert.equal(state.duration, 210);
+  } finally {
+    await media.stop();
+  }
+});
+
+test('DLNA waits for advancing playback when a reset report leaves out the duration', async () => {
+  const { host, transport, media, poll, ended, calls } = timedDlnaHarness();
+  try {
+    await host.connect('uuid:renderer-1');
+    await host.load(transport.uri, host.beginSourceChange());
+    await host.play();
+    await poll({ rel: '00:01:56' });
+    await poll({ rel: '00:01:58' });
+
+    await poll({ rel: '00:00:00', dur: 'NOT_IMPLEMENTED' });
+    await poll();
+    assert.deepEqual(ended(), []);
+    assert.equal(calls.filter(({ name }) => name === 'Stop').length, 0);
+
+    await poll({ rel: '00:00:01', dur: '00:02:00' });
+    assert.equal(ended().length, 1);
+    assert.equal(calls.filter(({ name }) => name === 'Stop').length, 1);
+  } finally {
+    await media.stop();
+  }
+});
+
+test('DLNA keeps playing after a premature reset or a user seek to zero', async (t) => {
+  const scenarios = [
+    { name: 'position and duration briefly reset before the end', delayMs: 300, rel: '00:01:59' },
+    {
+      name: 'an early reset persists past the guessed end',
+      delayMs: 300,
+      rel: '00:01:59',
+      repeat: true,
+    },
+    { name: 'the user seeks to the start', delayMs: 2_000, rel: '00:00:01', seek: true },
+  ];
+  for (const { name, delayMs, rel, repeat, seek } of scenarios) {
+    await t.test(name, async () => {
+      const { host, transport, media, poll, ended, calls } = timedDlnaHarness();
+      try {
+        await host.connect('uuid:renderer-1');
+        await host.load(transport.uri, host.beginSourceChange());
+        await host.play();
+        await poll({ rel: '00:01:56' });
+        await poll({ rel: '00:01:58' });
+        if (seek) await host.seek(0);
+
+        await poll({ rel: '00:00:00', dur: '00:00:00' }, delayMs);
+        assert.deepEqual(ended(), []);
+        if (repeat) {
+          await poll({}, 1_700);
+          assert.deepEqual(ended(), []);
+        }
+        await poll({ rel, dur: '00:02:00' }, 1_000);
+        assert.deepEqual(ended(), []);
+        assert.equal(calls.filter(({ name }) => name === 'Stop').length, 0);
+        const state = await host.getState();
+        assert.equal(state.playing, true);
+        assert.equal(state.timePos, seek ? 1 : 119);
+      } finally {
+        await media.stop();
+      }
+    });
+  }
+});
+
+test('DLNA polls more often near the end and waits for each reply before polling again', async () => {
+  let now = 1_000;
+  const scheduled = new Set();
+  const positionReply = Promise.withResolvers();
+  let holdPosition = false;
+  const { host, transport, calls, player, media } = harness({
+    now: () => now,
+    beforePositionReply: () => (holdPosition ? positionReply.promise : undefined),
+    schedule(fire, interval) {
+      const timer = { fire, interval, due: now + interval };
+      scheduled.add(timer);
+      return { cancel: () => scheduled.delete(timer) };
+    },
+  });
+  const advance = async (delay, report = {}) => {
+    now += delay;
+    Object.assign(transport, report);
+    for (const timer of [...scheduled]) {
+      if (timer.due > now) continue;
+      timer.due = now + timer.interval;
+      timer.fire();
+    }
+    await tick();
+  };
+  const pendingIntervals = () => [...scheduled].map(({ interval }) => interval);
+  const positionsRequested = () => calls.filter(({ name }) => name === 'GetPositionInfo').length;
+  try {
+    await host.connect('uuid:renderer-1');
+    await host.load(transport.uri, host.beginSourceChange());
+    await host.play();
+    assert.deepEqual(pendingIntervals(), [2_000]);
+
+    await advance(2_000, { rel: '00:01:53' });
+    assert.deepEqual(pendingIntervals(), [2_000]);
+    await advance(2_000, { rel: '00:01:55' });
+    assert.deepEqual(pendingIntervals(), [300]);
+
+    holdPosition = true;
+    const previousRequests = positionsRequested();
+    await advance(300, { rel: '00:01:56' });
+    assert.equal(positionsRequested(), previousRequests + 1);
+    await advance(1_200);
+    assert.equal(positionsRequested(), previousRequests + 1);
+
+    holdPosition = false;
+    positionReply.resolve();
+    await tick();
+    assert.deepEqual(pendingIntervals(), [300]);
+    await advance(300, { state: 'PAUSED_PLAYBACK' });
+    assert.deepEqual(pendingIntervals(), [2_000]);
+    assert.equal(
+      player.some(([event]) => event === 'playback-end'),
+      false,
+    );
+  } finally {
+    positionReply.resolve();
+    await host.shutdown();
+    await media.stop();
+  }
+});
+
+test('DLNA reports one EOF when progress stays at the end but the device still says PLAYING', async () => {
+  const { host, transport, media, poll, ended } = timedDlnaHarness();
+  try {
+    await host.connect('uuid:renderer-1');
+    host.setTrackMeta({ durationMs: 240_822 });
+    const loaded = await host.load(transport.uri, host.beginSourceChange());
+    await host.play();
+    await host.seek(234);
+    await poll({ dur: '00:04:00', rel: '00:03:54' });
+    await poll({ rel: '00:04:00' });
+    await poll();
+
+    assert.deepEqual(ended(), []);
+    assert.equal((await host.getState()).playing, true);
+
+    await poll();
+    assert.deepEqual(
+      ended().map(([, reason, context]) => [reason, context.trackSeq]),
+      [['eof', loaded.seq]],
+    );
+    assert.equal((await host.getState()).playing, false);
+
+    await poll();
+    assert.equal((await host.getState()).playing, false);
+    await poll({ state: 'STOPPED' });
+    assert.equal(ended().length, 1);
+  } finally {
+    await media.stop();
+  }
+});
+
+test('DLNA ignores a terminal timer interrupted by a nonterminal position', async () => {
+  const { host, transport, media, poll, ended, calls } = timedDlnaHarness();
+  try {
+    await host.connect('uuid:renderer-1');
+    await host.load(transport.uri, host.beginSourceChange());
+    await host.play();
+    await poll({ rel: '00:01:56' });
+    await poll({ rel: '00:01:58' });
+    await poll({ rel: '00:02:00' });
+    await poll({ rel: '00:01:30' });
+    await poll({ rel: '00:02:00' });
+
+    assert.deepEqual(ended(), []);
+    assert.equal(calls.filter(({ name }) => name === 'Stop').length, 0);
+    assert.equal((await host.getState()).playing, true);
+  } finally {
+    await media.stop();
+  }
+});
+
+test('DLNA allows playback to continue when progress stalls before the reported end', async () => {
+  const { host, transport, media, poll, ended, calls } = timedDlnaHarness();
+  try {
+    await host.connect('uuid:renderer-1');
+    await host.load(transport.uri, host.beginSourceChange());
+    await host.play();
+    await poll({ rel: '00:01:56' });
+    await poll({ rel: '00:01:58' });
+    await poll();
+    await poll();
+
+    assert.deepEqual(ended(), []);
+    assert.equal(calls.filter(({ name }) => name === 'Stop').length, 0);
+    const state = await host.getState();
+    assert.equal(state.playing, true);
+    assert.equal(state.timePos, 118);
+    assert.equal(state.duration, 120);
+  } finally {
+    await media.stop();
+  }
+});
+
+test('DLNA does not infer EOF from misleading position reports', async (t) => {
+  const scenarios = [
+    ['progress stalled before the end', { rel: '00:01:30' }],
+    ['the device stops before the end', { state: 'STOPPED', rel: '00:01:30' }],
+    ['the device reports a transport error', { state: 'STOPPED', status: 'ERROR_OCCURRED' }],
+    ['the device reports another URI', { uri: 'https://cdn.example/other.mp3' }],
+    ['the device reports no duration', { dur: '00:00:00' }],
+    ['paused by the user', {}, (host) => host.pause()],
+    ['stopped by the user', {}, (host) => host.stop()],
+    ['the previous position lingers after a seek', {}, (host) => host.seek(50)],
+  ];
+  for (const [name, report, interrupt] of scenarios) {
+    await t.test(name, async () => {
+      const { host, transport, media, poll, ended } = timedDlnaHarness();
+      try {
+        await host.connect('uuid:renderer-1');
+        host.setTrackMeta({ durationMs: 120_000 });
+        await host.load(transport.uri, host.beginSourceChange());
+        await host.play();
+        await poll({ rel: '00:01:30' });
+        await poll({ rel: '00:02:00', ...report });
+        await interrupt?.(host);
+        await poll();
+        await poll();
+        await poll();
+
+        assert.deepEqual(ended(), []);
+      } finally {
+        await media.stop();
+      }
+    });
+  }
+});
+
+test('DLNA accepts its own new track URI while setting the play mode', async () => {
+  const settingPlayMode = Promise.withResolvers();
+  const reply = Promise.withResolvers();
+  let holdPlayMode = false;
+  const { host, calls, transport, media } = harness({
+    beforeSetPlayModeReply: async () => {
+      if (!holdPlayMode) return;
+      settingPlayMode.resolve();
+      await reply.promise;
+    },
+  });
+  let loading;
+  try {
+    await host.connect('uuid:renderer-1');
+    const first = await host.load(transport.uri, host.beginSourceChange());
+    await host.play();
+
+    holdPlayMode = true;
+    const nextUri = 'https://cdn.example/next.mp3';
+    loading = host.load(nextUri, host.beginSourceChange());
+    await settingPlayMode.promise;
+    Object.assign(transport, { uri: nextUri, state: 'STOPPED', rel: '00:00:00' });
+    const observing = host.pollOnce();
+    await tick();
+
+    reply.resolve();
+    await observing;
+    assert.notEqual((await loading).seq, first.seq);
+    await host.play();
+    assert.equal(calls.filter(({ name }) => name === 'Play').length, 2);
+    assert.doesNotMatch(host.diagnosticMessage, /其他控制端接管/);
+  } finally {
+    reply.resolve();
+    await loading?.catch(() => {});
+    await media.stop();
+  }
+});
+
+test('a delayed notification for the preceding DLNA song does not take over the new one', async () => {
+  const { host, transport, media, poll, ended } = timedDlnaHarness();
+  try {
+    const previous = transport.uri;
+    const next = 'https://cdn.example/next.mp3';
+    await host.connect('uuid:renderer-1');
+    await host.load(previous, host.beginSourceChange());
+    await host.play();
+    const loaded = await host.load(next, host.beginSourceChange());
+    host.ingestLastChange(
+      `<Event><InstanceID val="0"><TransportState val="PLAYING"/><CurrentTrackURI val="${previous}"/></InstanceID></Event>`,
+    );
+    await host.play();
+    await poll({ uri: previous });
+    await poll({ uri: next, rel: '00:01:58' });
+    await poll({ state: 'STOPPED', rel: '00:02:00' });
+
+    assert.doesNotMatch(host.diagnosticMessage, /其他控制端接管/);
+    assert.deepEqual(
+      ended().map(([, reason, context]) => [reason, context.trackSeq]),
+      [['eof', loaded.seq]],
+    );
+  } finally {
+    await media.stop();
+  }
+});
+
+test('DLNA waits for the Stop from a natural wrap before replaying the same song', async () => {
+  const stopReply = Promise.withResolvers();
+  const { host, transport, media, poll, calls } = timedDlnaHarness({
+    beforeStopReply: () => stopReply.promise,
+  });
+  const loads = () => calls.filter(({ name }) => name === 'SetAVTransportURI');
+  let confirmingWrap;
+  let replay;
+  try {
+    await host.connect('uuid:renderer-1');
+    const first = await host.load(transport.uri, host.beginSourceChange());
+    await host.play();
+    await poll({ rel: '00:01:56' });
+    await poll({ rel: '00:01:58' });
+    await poll({ rel: '00:00:00', dur: '00:00:00' });
+    confirmingWrap = poll({ rel: '00:00:01', dur: '00:02:00' });
+    await tick();
+    assert.equal(calls.filter(({ name }) => name === 'Stop').length, 1);
+
+    replay = host.load(transport.uri, host.beginSourceChange());
+    await tick();
+    assert.equal(loads().length, 1);
+
+    stopReply.resolve();
+    await confirmingWrap;
+    assert.notEqual((await replay).seq, first.seq);
+    await host.play();
+    assert.deepEqual(
+      loads().map(({ args }) => args.CurrentURI),
+      [transport.uri, transport.uri],
+    );
+    assert.equal((await host.getState()).playing, true);
+  } finally {
+    stopReply.resolve();
+    await confirmingWrap?.catch(() => {});
+    await replay?.catch(() => {});
+    await media.stop();
+  }
+});
+
+test('a delayed DLNA poll cannot end a new occurrence of the same song', async () => {
+  const requestStarted = Promise.withResolvers();
+  const reply = Promise.withResolvers();
+  const { host, transport, player, media } = harness({
+    beforePositionReply: async () => {
+      requestStarted.resolve();
+      await reply.promise;
+    },
+  });
+  try {
+    await host.connect('uuid:renderer-1');
+    const first = await host.load(transport.uri, host.beginSourceChange());
+    await host.play();
+    Object.assign(transport, { state: 'STOPPED', rel: '00:02:00' });
+    const stalePoll = host.pollOnce();
+    await requestStarted.promise;
+
+    const replay = await host.load(transport.uri, host.beginSourceChange());
+    assert.notEqual(replay.seq, first.seq);
+    await host.play();
+    reply.resolve();
+    await stalePoll;
+
+    assert.equal(
+      player.some(([event]) => event === 'playback-end'),
+      false,
+    );
+    assert.equal((await host.getState()).playing, true);
+  } finally {
+    reply.resolve();
     await media.stop();
   }
 });
